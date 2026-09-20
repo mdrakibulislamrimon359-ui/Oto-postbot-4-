@@ -2,6 +2,8 @@ import os
 import sqlite3
 from datetime import time
 from zoneinfo import ZoneInfo
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
 
 from telegram import Update
 from telegram.ext import (
@@ -17,16 +19,23 @@ from telegram.ext import (
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME")
 
-# Admin Telegram Username
+# Channel হলে:
+# CHANNEL_USERNAME=@YourChannel
+
+# Group হলে:
+# TARGET_CHAT_ID=-1001234567890
+
+TARGET_CHAT_RAW = os.getenv("TARGET_CHAT_ID") or os.getenv("CHANNEL_USERNAME")
+
 ADMIN_USERNAME = "RJteam1"
 
-# Bangladesh Time
 TZ = ZoneInfo("Asia/Dhaka")
 
-# Database
 DB_NAME = "autopost.db"
+
+# Render port
+PORT = int(os.getenv("PORT", "10000"))
 
 
 # =========================================================
@@ -35,15 +44,82 @@ DB_NAME = "autopost.db"
 
 if not BOT_TOKEN:
     raise RuntimeError(
-        "BOT_TOKEN environment variable পাওয়া যায়নি। "
-        "Render Environment-এ BOT_TOKEN সেট করুন।"
+        "BOT_TOKEN পাওয়া যায়নি। Render Environment-এ BOT_TOKEN সেট করুন।"
     )
 
-if not CHANNEL_USERNAME:
+if not TARGET_CHAT_RAW:
     raise RuntimeError(
-        "CHANNEL_USERNAME environment variable পাওয়া যায়নি। "
-        "Render Environment-এ CHANNEL_USERNAME সেট করুন।"
+        "TARGET_CHAT_ID অথবা CHANNEL_USERNAME পাওয়া যায়নি। "
+        "Render Environment-এ সেট করুন।"
     )
+
+
+def get_target_chat():
+    value = TARGET_CHAT_RAW.strip()
+
+    # Group ID হলে integer
+    if value.lstrip("-").isdigit():
+        return int(value)
+
+    # Channel username হলে @username
+    return value
+
+
+TARGET_CHAT = get_target_chat()
+
+
+# =========================================================
+# RENDER HEALTH SERVER
+# =========================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8"
+        )
+        self.end_headers()
+
+        self.wfile.write(
+            b"RJ Auto Post Bot is running!"
+        )
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8"
+        )
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+def run_health_server():
+
+    server = HTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler
+    )
+
+    print(
+        f"🌐 Render health server running on port {PORT}"
+    )
+
+    server.serve_forever()
+
+
+def start_health_server():
+
+    thread = Thread(
+        target=run_health_server,
+        daemon=True
+    )
+
+    thread.start()
 
 
 # =========================================================
@@ -51,7 +127,14 @@ if not CHANNEL_USERNAME:
 # =========================================================
 
 def db():
-    return sqlite3.connect(DB_NAME)
+
+    con = sqlite3.connect(DB_NAME)
+
+    con.execute(
+        "PRAGMA busy_timeout = 5000"
+    )
+
+    return con
 
 
 def init_db():
@@ -63,7 +146,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             post_time TEXT NOT NULL,
-            photo_id TEXT NOT NULL,
+            photo_id TEXT NOT NULL DEFAULT '',
             caption TEXT NOT NULL,
             enabled INTEGER DEFAULT 1
         )
@@ -91,28 +174,16 @@ def is_admin(user):
 
 
 # =========================================================
-# REMOVE SCHEDULED JOBS
+# TIME VALIDATION
 # =========================================================
 
-def remove_all_post_jobs(application):
-
-    for job in application.job_queue.jobs():
-
-        if job.name and job.name.startswith("post_"):
-            job.schedule_removal()
-
-
-# =========================================================
-# SCHEDULE ONE POST
-# =========================================================
-
-def schedule_post(application, post_id, post_time):
+def validate_time(post_time):
 
     try:
 
         hour, minute = map(
             int,
-            post_time.split(":")
+            post_time.strip().split(":")
         )
 
         if not (
@@ -120,48 +191,94 @@ def schedule_post(application, post_id, post_time):
             and
             0 <= minute <= 59
         ):
-            raise ValueError
+            return None
 
-    except ValueError:
-
-        print(
-            f"Invalid time for post {post_id}: {post_time}"
+        return time(
+            hour=hour,
+            minute=minute,
+            tzinfo=TZ
         )
 
-        return
+    except (ValueError, TypeError):
 
-    post_time_obj = time(
-        hour=hour,
-        minute=minute,
-        tzinfo=TZ
-    )
-
-    job_name = f"post_{post_id}"
-
-    # Duplicate job prevent
-    for job in application.job_queue.jobs():
-
-        if job.name == job_name:
-            job.schedule_removal()
-
-    application.job_queue.run_daily(
-        send_post,
-        time=post_time_obj,
-        days=tuple(range(7)),
-        data={
-            "id": post_id
-        },
-        name=job_name
-    )
+        return None
 
 
 # =========================================================
-# SCHEDULE ALL POSTS
+# REMOVE ALL JOBS
+# =========================================================
+
+def remove_all_post_jobs(application):
+
+    if not application.job_queue:
+        return
+
+    for job in application.job_queue.jobs():
+
+        if job.name and job.name.startswith("post_"):
+
+            job.schedule_removal()
+
+
+# =========================================================
+# SCHEDULE ONE POST
+# =========================================================
+
+def schedule_post(
+    application,
+    post_id,
+    post_time
+):
+
+    post_time_obj = validate_time(
+        post_time
+    )
+
+    if post_time_obj is None:
+
+        print(
+            f"❌ Invalid time for post "
+            f"{post_id}: {post_time}"
+        )
+
+        return False
+
+    job_name = f"post_{post_id}"
+
+    # Duplicate job remove
+    for job in application.job_queue.jobs():
+
+        if job.name == job_name:
+
+            job.schedule_removal()
+
+    application.job_queue.run_daily(
+
+        send_post,
+
+        time=post_time_obj,
+
+        days=tuple(range(7)),
+
+        data={
+            "id": post_id
+        },
+
+        name=job_name
+    )
+
+    return True
+
+
+# =========================================================
+# SCHEDULE ALL
 # =========================================================
 
 def schedule_all(application):
 
-    remove_all_post_jobs(application)
+    remove_all_post_jobs(
+        application
+    )
 
     con = db()
     cur = con.cursor()
@@ -185,7 +302,7 @@ def schedule_all(application):
         )
 
     print(
-        f"Loaded {len(rows)} scheduled posts."
+        f"📅 Loaded {len(rows)} scheduled posts."
     )
 
 
@@ -198,7 +315,9 @@ async def start(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_admin(update.effective_user):
+    if not is_admin(
+        update.effective_user
+    ):
 
         await update.message.reply_text(
             "❌ আপনি এই Bot-এর Admin নন।"
@@ -207,14 +326,23 @@ async def start(
         return
 
     text = """
-🤖 Telegram Auto Post Bot
+🤖 RJ Team Auto Post Bot
 
 👑 Admin: @RJteam1
 
-📸 Auto Post তৈরি করতে ছবি পাঠান
-এবং Caption এ লিখুন:
+📸 ছবি সহ Auto Post:
+
+ছবি পাঠিয়ে Caption-এ লিখুন:
 
 06:00|সুপ্রভাত 🌅
+
+
+📝 শুধু Text Auto Post:
+
+01:50|🌙 শুভ রাত্রি 🌙
+
+
+আরও উদাহরণ:
 
 08:00|Good Morning ☀️
 
@@ -223,6 +351,9 @@ async def start(
 17:00|বিকেলের শুভেচ্ছা 🌇
 
 19:00|সন্ধ্যার পোস্ট 🌙
+
+
+⏰ Bangladesh Time অনুযায়ী প্রতিদিন পোস্ট হবে।
 
 
 📋 Commands:
@@ -244,12 +375,11 @@ async def start(
 
 /help
 Help দেখুন
-
-
-🇧🇩 Timezone: Bangladesh
 """
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text
+    )
 
 
 # =========================================================
@@ -261,27 +391,35 @@ async def help_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_admin(update.effective_user):
+    if not is_admin(
+        update.effective_user
+    ):
         return
 
     await update.message.reply_text(
-        "📸 ছবি পাঠিয়ে Caption এ লিখুন:\n\n"
+        "📸 ছবি + Caption:\n\n"
         "06:00|সুপ্রভাত 🌅\n\n"
+        "📝 শুধু Text:\n\n"
+        "01:50|🌙 শুভ রাত্রি 🌙\n\n"
         "⏰ Bangladesh Time অনুযায়ী "
         "প্রতিদিন পোস্ট হবে।"
     )
 
 
 # =========================================================
-# RECEIVE PHOTO
+# SAVE POST
 # =========================================================
 
-async def receive_photo(
+async def save_post(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
+    photo_id="",
+    raw_caption=None
 ):
 
-    if not is_admin(update.effective_user):
+    if not is_admin(
+        update.effective_user
+    ):
 
         await update.message.reply_text(
             "❌ Admin only"
@@ -289,18 +427,16 @@ async def receive_photo(
 
         return
 
-    photo = update.message.photo[-1]
-    caption = update.message.caption
+    caption = raw_caption
 
-    if not caption:
+    if caption is None:
 
-        await update.message.reply_text(
-            "❌ Caption এ সময় দিতে হবে।\n\n"
-            "উদাহরণ:\n"
-            "06:00|সুপ্রভাত 🌅"
+        caption = (
+            update.message.caption
+            or ""
         )
 
-        return
+    caption = caption.strip()
 
     if "|" not in caption:
 
@@ -318,24 +454,11 @@ async def receive_photo(
     )
 
     post_time = post_time.strip()
+
     post_caption = post_caption.strip()
 
-    # Time check
-    try:
-
-        hour, minute = map(
-            int,
-            post_time.split(":")
-        )
-
-        if not (
-            0 <= hour <= 23
-            and
-            0 <= minute <= 59
-        ):
-            raise ValueError
-
-    except ValueError:
+    # Check time
+    if validate_time(post_time) is None:
 
         await update.message.reply_text(
             "❌ সময় ভুল।\n\n"
@@ -368,7 +491,7 @@ async def receive_photo(
         VALUES (?, ?, ?, 1)
     """, (
         post_time,
-        photo.file_id,
+        photo_id or "",
         post_caption
     ))
 
@@ -384,13 +507,80 @@ async def receive_photo(
         post_time
     )
 
+    post_type = (
+        "📸 ছবি + Caption"
+        if photo_id
+        else
+        "📝 Text"
+    )
+
     await update.message.reply_text(
         f"✅ Auto Post Save হয়েছে!\n\n"
         f"🆔 ID: {post_id}\n"
+        f"📦 Type: {post_type}\n"
         f"⏰ সময়: {post_time}\n"
         f"📝 Caption: {post_caption}\n\n"
         f"🇧🇩 Bangladesh Time অনুযায়ী "
         f"প্রতিদিন পোস্ট হবে।"
+    )
+
+
+# =========================================================
+# PHOTO
+# =========================================================
+
+async def receive_photo(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    photo = update.message.photo[-1]
+
+    caption = update.message.caption
+
+    if not caption:
+
+        if not is_admin(
+            update.effective_user
+        ):
+            return
+
+        await update.message.reply_text(
+            "❌ Caption-এ সময় দিতে হবে।\n\n"
+            "উদাহরণ:\n"
+            "06:00|সুপ্রভাত 🌅"
+        )
+
+        return
+
+    await save_post(
+        update,
+        context,
+        photo_id=photo.file_id,
+        raw_caption=caption
+    )
+
+
+# =========================================================
+# TEXT POST
+# =========================================================
+
+async def receive_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = update.message.text or ""
+
+    # শুধু schedule format হলে process করবে
+    if "|" not in text:
+        return
+
+    await save_post(
+        update,
+        context,
+        photo_id="",
+        raw_caption=text
     )
 
 
@@ -403,7 +593,9 @@ async def list_posts(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_admin(update.effective_user):
+    if not is_admin(
+        update.effective_user
+    ):
         return
 
     con = db()
@@ -414,7 +606,8 @@ async def list_posts(
             id,
             post_time,
             caption,
-            enabled
+            enabled,
+            photo_id
         FROM posts
         ORDER BY post_time
     """)
@@ -433,19 +626,65 @@ async def list_posts(
 
     text = "📋 Auto Post Schedule\n\n"
 
-    for post_id, post_time, caption, enabled in rows:
+    for (
+        post_id,
+        post_time,
+        caption,
+        enabled,
+        photo_id
+    ) in rows:
 
-        status = "🟢 ON" if enabled else "🔴 OFF"
+        status = (
+            "🟢 ON"
+            if enabled
+            else
+            "🔴 OFF"
+        )
+
+        post_type = (
+            "📸 Photo"
+            if photo_id
+            else
+            "📝 Text"
+        )
 
         text += (
             f"🆔 ID: {post_id}\n"
+            f"📦 Type: {post_type}\n"
             f"⏰ Time: {post_time}\n"
             f"📌 Status: {status}\n"
             f"📝 {caption}\n"
             f"──────────────\n"
         )
 
-    await update.message.reply_text(text)
+    # Telegram message limit
+    if len(text) <= 4000:
+
+        await update.message.reply_text(
+            text
+        )
+
+    else:
+
+        chunk = ""
+
+        for line in text.splitlines(True):
+
+            if len(chunk) + len(line) > 4000:
+
+                await update.message.reply_text(
+                    chunk
+                )
+
+                chunk = ""
+
+            chunk += line
+
+        if chunk:
+
+            await update.message.reply_text(
+                chunk
+            )
 
 
 # =========================================================
@@ -457,7 +696,9 @@ async def delete_post(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_admin(update.effective_user):
+    if not is_admin(
+        update.effective_user
+    ):
         return
 
     if not context.args:
@@ -471,7 +712,9 @@ async def delete_post(
 
     try:
 
-        post_id = int(context.args[0])
+        post_id = int(
+            context.args[0]
+        )
 
     except ValueError:
 
@@ -496,9 +739,14 @@ async def delete_post(
 
     if deleted:
 
-        for job in context.application.job_queue.jobs():
+        for job in (
+            context.application
+            .job_queue
+            .jobs()
+        ):
 
             if job.name == f"post_{post_id}":
+
                 job.schedule_removal()
 
         await update.message.reply_text(
@@ -513,7 +761,7 @@ async def delete_post(
 
 
 # =========================================================
-# CLEAR ALL
+# CLEAR
 # =========================================================
 
 async def clear_posts(
@@ -521,13 +769,17 @@ async def clear_posts(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_admin(update.effective_user):
+    if not is_admin(
+        update.effective_user
+    ):
         return
 
     con = db()
     cur = con.cursor()
 
-    cur.execute("DELETE FROM posts")
+    cur.execute(
+        "DELETE FROM posts"
+    )
 
     con.commit()
     con.close()
@@ -550,6 +802,7 @@ async def send_post(
 ):
 
     data = context.job.data
+
     post_id = data["id"]
 
     con = db()
@@ -562,7 +815,9 @@ async def send_post(
             enabled
         FROM posts
         WHERE id=?
-    """, (post_id,))
+    """, (
+        post_id,
+    ))
 
     row = cur.fetchone()
 
@@ -578,11 +833,20 @@ async def send_post(
 
     try:
 
-        await context.bot.send_photo(
-            chat_id=CHANNEL_USERNAME,
-            photo=photo_id,
-            caption=caption
-        )
+        if photo_id:
+
+            await context.bot.send_photo(
+                chat_id=TARGET_CHAT,
+                photo=photo_id,
+                caption=caption
+            )
+
+        else:
+
+            await context.bot.send_message(
+                chat_id=TARGET_CHAT,
+                text=caption
+            )
 
         print(
             f"✅ POST SENT: {post_id}"
@@ -591,7 +855,7 @@ async def send_post(
     except Exception as e:
 
         print(
-            f"❌ POST ERROR: {e}"
+            f"❌ POST ERROR {post_id}: {e}"
         )
 
 
@@ -604,7 +868,9 @@ async def bot_on(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_admin(update.effective_user):
+    if not is_admin(
+        update.effective_user
+    ):
         return
 
     con = db()
@@ -636,7 +902,9 @@ async def bot_off(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_admin(update.effective_user):
+    if not is_admin(
+        update.effective_user
+    ):
         return
 
     con = db()
@@ -659,13 +927,32 @@ async def bot_off(
 
 
 # =========================================================
+# ERROR HANDLER
+# =========================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    print(
+        f"❌ Telegram error: {context.error}"
+    )
+
+
+# =========================================================
 # MAIN
 # =========================================================
 
 def main():
 
+    # Database
     init_db()
 
+    # Render Web Service port
+    start_health_server()
+
+    # Telegram application
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -674,34 +961,55 @@ def main():
 
     # Commands
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     application.add_handler(
-        CommandHandler("help", help_command)
+        CommandHandler(
+            "help",
+            help_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("list", list_posts)
+        CommandHandler(
+            "list",
+            list_posts
+        )
     )
 
     application.add_handler(
-        CommandHandler("delete", delete_post)
+        CommandHandler(
+            "delete",
+            delete_post
+        )
     )
 
     application.add_handler(
-        CommandHandler("clear", clear_posts)
+        CommandHandler(
+            "clear",
+            clear_posts
+        )
     )
 
     application.add_handler(
-        CommandHandler("on", bot_on)
+        CommandHandler(
+            "on",
+            bot_on
+        )
     )
 
     application.add_handler(
-        CommandHandler("off", bot_off)
+        CommandHandler(
+            "off",
+            bot_off
+        )
     )
 
-    # Photo
+    # Photo Auto Post
     application.add_handler(
         MessageHandler(
             filters.PHOTO,
@@ -709,13 +1017,37 @@ def main():
         )
     )
 
-    # Load saved schedules
-    schedule_all(application)
-
-    print(
-        "🤖 Auto Post Bot Started..."
+    # Text Auto Post
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            receive_text
+        )
     )
 
+    # Error handler
+    application.add_error_handler(
+        error_handler
+    )
+
+    # Load saved schedules
+    schedule_all(
+        application
+    )
+
+    print(
+        "🤖 RJ Team Auto Post Bot Started..."
+    )
+
+    print(
+        f"🎯 Target: {TARGET_CHAT_RAW}"
+    )
+
+    print(
+        "🇧🇩 Timezone: Asia/Dhaka"
+    )
+
+    # Start Telegram bot
     application.run_polling()
 
 
