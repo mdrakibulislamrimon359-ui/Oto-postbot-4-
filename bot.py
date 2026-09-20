@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from datetime import time
 from zoneinfo import ZoneInfo
@@ -15,10 +16,8 @@ from telegram.ext import (
 # CONFIG
 # =========================================================
 
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-
-# যে Channel-এ পোস্ট হবে
-CHANNEL_USERNAME = "@YOUR_CHANNEL"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME")
 
 # Admin Telegram Username
 ADMIN_USERNAME = "RJteam1"
@@ -28,6 +27,23 @@ TZ = ZoneInfo("Asia/Dhaka")
 
 # Database
 DB_NAME = "autopost.db"
+
+
+# =========================================================
+# CONFIG CHECK
+# =========================================================
+
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN environment variable পাওয়া যায়নি। "
+        "Render Environment-এ BOT_TOKEN সেট করুন।"
+    )
+
+if not CHANNEL_USERNAME:
+    raise RuntimeError(
+        "CHANNEL_USERNAME environment variable পাওয়া যায়নি। "
+        "Render Environment-এ CHANNEL_USERNAME সেট করুন।"
+    )
 
 
 # =========================================================
@@ -99,6 +115,13 @@ def schedule_post(application, post_id, post_time):
             post_time.split(":")
         )
 
+        if not (
+            0 <= hour <= 23
+            and
+            0 <= minute <= 59
+        ):
+            raise ValueError
+
     except ValueError:
 
         print(
@@ -138,7 +161,6 @@ def schedule_post(application, post_id, post_time):
 
 def schedule_all(application):
 
-    # Remove old jobs first
     remove_all_post_jobs(application)
 
     con = db()
@@ -268,10 +290,8 @@ async def receive_photo(
         return
 
     photo = update.message.photo[-1]
-
     caption = update.message.caption
 
-    # Caption নেই
     if not caption:
 
         await update.message.reply_text(
@@ -282,7 +302,6 @@ async def receive_photo(
 
         return
 
-    # | নেই
     if "|" not in caption:
 
         await update.message.reply_text(
@@ -314,7 +333,6 @@ async def receive_photo(
             and
             0 <= minute <= 59
         ):
-
             raise ValueError
 
     except ValueError:
@@ -327,7 +345,6 @@ async def receive_photo(
 
         return
 
-    # Caption check
     if not post_caption:
 
         await update.message.reply_text(
@@ -360,7 +377,7 @@ async def receive_photo(
     con.commit()
     con.close()
 
-    # Immediately schedule
+    # Schedule
     schedule_post(
         context.application,
         post_id,
@@ -418,12 +435,7 @@ async def list_posts(
 
     for post_id, post_time, caption, enabled in rows:
 
-        status = (
-            "🟢 ON"
-            if enabled
-            else
-            "🔴 OFF"
-        )
+        status = "🟢 ON" if enabled else "🔴 OFF"
 
         text += (
             f"🆔 ID: {post_id}\n"
@@ -459,9 +471,7 @@ async def delete_post(
 
     try:
 
-        post_id = int(
-            context.args[0]
-        )
+        post_id = int(context.args[0])
 
     except ValueError:
 
@@ -486,11 +496,9 @@ async def delete_post(
 
     if deleted:
 
-        # Remove scheduled job
         for job in context.application.job_queue.jobs():
 
             if job.name == f"post_{post_id}":
-
                 job.schedule_removal()
 
         await update.message.reply_text(
@@ -519,14 +527,11 @@ async def clear_posts(
     con = db()
     cur = con.cursor()
 
-    cur.execute(
-        "DELETE FROM posts"
-    )
+    cur.execute("DELETE FROM posts")
 
     con.commit()
     con.close()
 
-    # Remove all jobs
     remove_all_post_jobs(
         context.application
     )
@@ -545,7 +550,6 @@ async def send_post(
 ):
 
     data = context.job.data
-
     post_id = data["id"]
 
     con = db()
@@ -558,9 +562,7 @@ async def send_post(
             enabled
         FROM posts
         WHERE id=?
-    """, (
-        post_id,
-    ))
+    """, (post_id,))
 
     row = cur.fetchone()
 
@@ -571,7 +573,6 @@ async def send_post(
 
     photo_id, caption, enabled = row
 
-    # Disabled
     if not enabled:
         return
 
@@ -616,7 +617,6 @@ async def bot_on(
     con.commit()
     con.close()
 
-    # Re-create schedules
     schedule_all(
         context.application
     )
@@ -649,7 +649,6 @@ async def bot_off(
     con.commit()
     con.close()
 
-    # Remove schedules
     remove_all_post_jobs(
         context.application
     )
@@ -665,10 +664,8 @@ async def bot_off(
 
 def main():
 
-    # Database তৈরি
     init_db()
 
-    # Bot
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -677,52 +674,31 @@ def main():
 
     # Commands
     application.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
+        CommandHandler("start", start)
     )
 
     application.add_handler(
-        CommandHandler(
-            "help",
-            help_command
-        )
+        CommandHandler("help", help_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "list",
-            list_posts
-        )
+        CommandHandler("list", list_posts)
     )
 
     application.add_handler(
-        CommandHandler(
-            "delete",
-            delete_post
-        )
+        CommandHandler("delete", delete_post)
     )
 
     application.add_handler(
-        CommandHandler(
-            "clear",
-            clear_posts
-        )
+        CommandHandler("clear", clear_posts)
     )
 
     application.add_handler(
-        CommandHandler(
-            "on",
-            bot_on
-        )
+        CommandHandler("on", bot_on)
     )
 
     application.add_handler(
-        CommandHandler(
-            "off",
-            bot_off
-        )
+        CommandHandler("off", bot_off)
     )
 
     # Photo
@@ -734,9 +710,7 @@ def main():
     )
 
     # Load saved schedules
-    schedule_all(
-        application
-    )
+    schedule_all(application)
 
     print(
         "🤖 Auto Post Bot Started..."
