@@ -1,10 +1,13 @@
 import os
 import re
-import sqlite3
+import json
 import threading
 from datetime import time
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 from telegram import Update
 from telegram.ext import (
@@ -27,15 +30,19 @@ TARGET_CHAT_RAW = (
     or "@RJteam123890"
 )
 
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "RJteam1").strip().lstrip("@")
+ADMIN_USERNAME = os.getenv(
+    "ADMIN_USERNAME",
+    "RJteam1"
+).strip().lstrip("@")
 
 TZ = ZoneInfo("Asia/Dhaka")
-DB_NAME = "autopost.db"
 
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is missing.")
+    raise RuntimeError(
+        "BOT_TOKEN environment variable is missing."
+    )
 
 
 # =========================================================
@@ -55,23 +62,90 @@ TARGET_CHAT = parse_target_chat(TARGET_CHAT_RAW)
 
 
 # =========================================================
+# FIREBASE
+# =========================================================
+
+def init_firebase():
+
+    # Option 1:
+    # Firebase service account JSON as environment variable
+    firebase_json = os.getenv("FIREBASE_SERVICE_ACCOUNT")
+
+    if firebase_json:
+
+        try:
+            service_account_info = json.loads(firebase_json)
+
+            cred = credentials.Certificate(
+                service_account_info
+            )
+
+        except Exception as e:
+            raise RuntimeError(
+                f"Invalid FIREBASE_SERVICE_ACCOUNT: {e}"
+            )
+
+    # Option 2:
+    # Local JSON file
+    else:
+
+        json_file = os.getenv(
+            "FIREBASE_CREDENTIALS",
+            "firebase-service-account.json"
+        )
+
+        if not os.path.exists(json_file):
+            raise RuntimeError(
+                "Firebase credentials missing. "
+                "Set FIREBASE_SERVICE_ACCOUNT or "
+                "upload firebase-service-account.json."
+            )
+
+        cred = credentials.Certificate(json_file)
+
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(cred)
+
+    return firestore.client()
+
+
+db = init_firebase()
+
+POSTS_COLLECTION = "scheduled_posts"
+
+
+# =========================================================
 # RENDER HEALTH SERVER
 # =========================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
+
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+
+        self.send_header(
+            "Content-Type",
+            "text/plain"
+        )
+
         self.end_headers()
-        self.wfile.write(b"Bot is running.")
+
+        self.wfile.write(
+            b"Bot is running."
+        )
 
     def log_message(self, format, *args):
         return
 
 
 def start_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+
+    server = HTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler
+    )
+
     server.serve_forever()
 
 
@@ -82,54 +156,14 @@ threading.Thread(
 
 
 # =========================================================
-# DATABASE
-# =========================================================
-
-def db_connect():
-    return sqlite3.connect(DB_NAME)
-
-
-def init_db():
-
-    conn = db_connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            post_time TEXT NOT NULL,
-            photo_id TEXT,
-            caption TEXT NOT NULL,
-            enabled INTEGER DEFAULT 1
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-# =========================================================
 # TIME SYSTEM
 # =========================================================
 
 def normalize_time(value):
-    """
-    Supports:
-
-    06:00 AM
-    6:00 AM
-    06:00 PM
-    6:00 PM
-
-    Also supports old 24-hour format:
-
-    06:00
-    18:00
-    """
 
     value = value.strip().upper()
 
-    # 12-hour AM/PM
+    # 12-hour format
     match = re.fullmatch(
         r"(\d{1,2}):(\d{2})\s*(AM|PM)",
         value
@@ -142,21 +176,28 @@ def normalize_time(value):
         ampm = match.group(3)
 
         if hour < 1 or hour > 12:
-            raise ValueError("Hour must be between 1 and 12.")
+            raise ValueError(
+                "Hour must be between 1 and 12."
+            )
 
         if minute < 0 or minute > 59:
-            raise ValueError("Minute must be between 00 and 59.")
+            raise ValueError(
+                "Minute must be between 00 and 59."
+            )
 
         if ampm == "AM":
+
             if hour == 12:
                 hour = 0
+
         else:
+
             if hour != 12:
                 hour += 12
 
         return f"{hour:02d}:{minute:02d}"
 
-    # Old 24-hour format support
+    # 24-hour format
     match = re.fullmatch(
         r"(\d{1,2}):(\d{2})",
         value
@@ -168,24 +209,28 @@ def normalize_time(value):
         minute = int(match.group(2))
 
         if hour < 0 or hour > 23:
-            raise ValueError("Hour must be between 00 and 23.")
+            raise ValueError(
+                "Hour must be between 00 and 23."
+            )
 
         if minute < 0 or minute > 59:
-            raise ValueError("Minute must be between 00 and 59.")
+            raise ValueError(
+                "Minute must be between 00 and 59."
+            )
 
         return f"{hour:02d}:{minute:02d}"
 
     raise ValueError(
-        "Invalid time. Use example: 06:00 AM or 06:00 PM"
+        "Invalid time. Example: 06:00 PM"
     )
 
 
 def display_time(value):
-    """
-    Converts database 24-hour time to 12-hour AM/PM display.
-    """
 
-    hour, minute = map(int, value.split(":"))
+    hour, minute = map(
+        int,
+        value.split(":")
+    )
 
     ampm = "AM"
 
@@ -197,14 +242,20 @@ def display_time(value):
     if display_hour == 0:
         display_hour = 12
 
-    return f"{display_hour:02d}:{minute:02d} {ampm}"
+    return (
+        f"{display_hour:02d}:"
+        f"{minute:02d} {ampm}"
+    )
 
 
 # =========================================================
 # ADMIN CHECK
 # =========================================================
 
-async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def is_admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     user = update.effective_user
 
@@ -212,9 +263,10 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return False
 
     # Group / Supergroup
-    if update.effective_chat and update.effective_chat.type in (
-        "group",
-        "supergroup"
+    if (
+        update.effective_chat
+        and update.effective_chat.type
+        in ("group", "supergroup")
     ):
 
         try:
@@ -224,45 +276,133 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user.id
             )
 
-            if member.status in ("administrator", "creator"):
+            if member.status in (
+                "administrator",
+                "creator"
+            ):
                 return True
 
         except Exception as e:
-            print("Admin check error:", e)
+
+            print(
+                "Admin check error:",
+                e
+            )
 
         return False
 
     # Private chat
-    username = (user.username or "").strip().lstrip("@")
+    username = (
+        user.username or ""
+    ).strip().lstrip("@")
 
-    return username.lower() == ADMIN_USERNAME.lower()
+    return (
+        username.lower()
+        == ADMIN_USERNAME.lower()
+    )
 
 
 # =========================================================
-# SCHEDULE POST
+# FIRESTORE HELPERS
 # =========================================================
 
-async def send_post(context: ContextTypes.DEFAULT_TYPE):
+def get_post(post_id):
+
+    doc = (
+        db.collection(POSTS_COLLECTION)
+        .document(str(post_id))
+        .get()
+    )
+
+    if not doc.exists:
+        return None
+
+    data = doc.to_dict()
+
+    data["id"] = doc.id
+
+    return data
+
+
+def get_all_posts():
+
+    docs = (
+        db.collection(POSTS_COLLECTION)
+        .stream()
+    )
+
+    posts = []
+
+    for doc in docs:
+
+        data = doc.to_dict()
+
+        data["id"] = doc.id
+
+        posts.append(data)
+
+    return posts
+
+
+def create_post(
+    post_time,
+    photo_id,
+    caption
+):
+
+    doc_ref = (
+        db.collection(POSTS_COLLECTION)
+        .document()
+    )
+
+    doc_ref.set({
+
+        "post_time": post_time,
+
+        "photo_id": photo_id,
+
+        "caption": caption,
+
+        "enabled": True,
+
+    })
+
+    return doc_ref.id
+
+
+# =========================================================
+# SEND POST
+# =========================================================
+
+async def send_post(
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     post_id = context.job.data["id"]
 
-    conn = db_connect()
-    cur = conn.cursor()
+    post = get_post(post_id)
 
-    cur.execute("""
-        SELECT id, post_time, photo_id, caption, enabled
-        FROM posts
-        WHERE id = ?
-    """, (post_id,))
-
-    row = cur.fetchone()
-
-    conn.close()
-
-    if not row:
+    if not post:
         return
 
-    post_id, post_time, photo_id, caption, enabled = row
+    post_time = post.get(
+        "post_time",
+        "00:00"
+    )
+
+    photo_id = post.get(
+        "photo_id"
+    )
+
+    caption = post.get(
+        "caption",
+        ""
+    )
+
+    enabled = post.get(
+        "enabled",
+        True
+    )
 
     if not enabled:
         return
@@ -272,26 +412,37 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE):
         if photo_id:
 
             await context.bot.send_photo(
+
                 chat_id=TARGET_CHAT,
+
                 photo=photo_id,
+
                 caption=caption
+
             )
 
         else:
 
             await context.bot.send_message(
+
                 chat_id=TARGET_CHAT,
+
                 text=caption
+
             )
 
         print(
-            f"POST SUCCESS | ID={post_id} | TIME={display_time(post_time)}"
+            f"POST SUCCESS | "
+            f"ID={post_id} | "
+            f"TIME={display_time(post_time)}"
         )
 
     except Exception as e:
 
         print(
-            f"POST ERROR | ID={post_id} | ERROR={e}"
+            f"POST ERROR | "
+            f"ID={post_id} | "
+            f"ERROR={e}"
         )
 
 
@@ -299,33 +450,53 @@ async def send_post(context: ContextTypes.DEFAULT_TYPE):
 # SCHEDULE ONE POST
 # =========================================================
 
-def schedule_post(application, post_id, post_time):
+def schedule_post(
+    application,
+    post_id,
+    post_time
+):
 
-    hour, minute = map(int, post_time.split(":"))
+    hour, minute = map(
+        int,
+        post_time.split(":")
+    )
 
-    # Remove old job
     job_name = f"post_{post_id}"
 
-    old_jobs = application.job_queue.get_jobs_by_name(job_name)
+    # Remove old job
+    old_jobs = (
+        application.job_queue
+        .get_jobs_by_name(job_name)
+    )
 
     for job in old_jobs:
+
         job.schedule_removal()
 
-    # Daily job
+    # Daily schedule
     application.job_queue.run_daily(
+
         send_post,
+
         time=time(
             hour=hour,
             minute=minute,
             tzinfo=TZ
         ),
+
         days=tuple(range(7)),
-        data={"id": post_id},
+
+        data={
+            "id": post_id
+        },
+
         name=job_name
     )
 
     print(
-        f"SCHEDULED | ID={post_id} | TIME={display_time(post_time)}"
+        f"SCHEDULED | "
+        f"ID={post_id} | "
+        f"TIME={display_time(post_time)}"
     )
 
 
@@ -335,24 +506,24 @@ def schedule_post(application, post_id, post_time):
 
 def schedule_all(application):
 
-    conn = db_connect()
-    cur = conn.cursor()
+    posts = get_all_posts()
 
-    cur.execute("""
-        SELECT id, post_time
-        FROM posts
-        WHERE enabled = 1
-    """)
+    for post in posts:
 
-    rows = cur.fetchall()
+        if not post.get(
+            "enabled",
+            True
+        ):
+            continue
 
-    conn.close()
-
-    for post_id, post_time in rows:
         schedule_post(
+
             application,
-            post_id,
-            post_time
+
+            post["id"],
+
+            post["post_time"]
+
         )
 
 
@@ -360,21 +531,33 @@ def schedule_all(application):
 # START
 # =========================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    if not await is_admin(update, context):
+    if not await is_admin(
+        update,
+        context
+    ):
         return
 
     await update.message.reply_text(
+
         "🤖 Auto Post Bot চালু আছে!\n\n"
+
         "🕐 Time format:\n"
         "06:00 AM = সকাল ৬টা\n"
         "12:00 PM = দুপুর ১২টা\n"
         "06:00 PM = সন্ধ্যা ৬টা\n"
         "11:00 PM = রাত ১১টা\n\n"
-        "Text post example:\n"
+
+        "📝 Text example:\n"
         "06:00 PM|🌙 শুভ সন্ধ্যা 🌙\n\n"
-        "Photo post করতে photo পাঠিয়ে caption-এ একই format ব্যবহার করুন।"
+
+        "📷 Photo example:\n"
+        "Photo পাঠিয়ে caption লিখুন:\n"
+        "06:00 PM|🌙 শুভ সন্ধ্যা 🌙"
     )
 
 
@@ -382,13 +565,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # HELP
 # =========================================================
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    if not await is_admin(update, context):
+    if not await is_admin(
+        update,
+        context
+    ):
         return
 
     await update.message.reply_text(
+
         "📚 Commands:\n\n"
+
         "/start - Bot start\n"
         "/help - Help\n"
         "/list - Saved posts\n"
@@ -398,11 +589,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/clear - Delete all posts\n"
         "/on - Enable all posts\n"
         "/off - Disable all posts\n\n"
+
         "🕐 Time examples:\n"
         "06:00 AM\n"
         "12:00 PM\n"
         "06:00 PM\n"
-        "11:30 PM\n"
+        "11:30 PM"
     )
 
 
@@ -410,12 +602,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # SAVE TEXT POST
 # =========================================================
 
-async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def text_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    if not await is_admin(update, context):
+    if not await is_admin(
+        update,
+        context
+    ):
         return
 
-    if not update.message or not update.message.text:
+    if (
+        not update.message
+        or not update.message.text
+    ):
         return
 
     text = update.message.text.strip()
@@ -423,51 +624,46 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "|" not in text:
         return
 
-    time_part, caption = text.split("|", 1)
+    time_part, caption = text.split(
+        "|",
+        1
+    )
 
     caption = caption.strip()
 
     if not caption:
+
         await update.message.reply_text(
             "❌ Caption খালি রাখা যাবে না।"
         )
+
         return
 
     try:
-        post_time = normalize_time(time_part)
+
+        post_time = normalize_time(
+            time_part
+        )
 
     except ValueError:
 
         await update.message.reply_text(
+
             "❌ Time ভুল।\n\n"
-            "এভাবে লিখুন:\n"
+
+            "Example:\n"
             "06:00 AM|সুপ্রভাত 🌞\n"
             "06:00 PM|শুভ সন্ধ্যা 🌙"
+
         )
 
         return
 
-    conn = db_connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO posts (
-            post_time,
-            photo_id,
-            caption,
-            enabled
-        )
-        VALUES (?, ?, ?, 1)
-    """, (
+    post_id = create_post(
         post_time,
         None,
         caption
-    ))
-
-    post_id = cur.lastrowid
-
-    conn.commit()
-    conn.close()
+    )
 
     schedule_post(
         context.application,
@@ -476,10 +672,13 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
+
         f"✅ Post saved!\n\n"
+
         f"🆔 ID: {post_id}\n"
         f"⏰ Time: {display_time(post_time)}\n"
-        f"📅 প্রতিদিন এই সময়ে পোস্ট হবে।"
+        f"📅 প্রতিদিন এই সময়ে পোস্ট হবে।\n"
+        f"🔥 Firebase-এ save হয়েছে।"
     )
 
 
@@ -487,27 +686,45 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # SAVE PHOTO POST
 # =========================================================
 
-async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def photo_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    if not await is_admin(update, context):
+    if not await is_admin(
+        update,
+        context
+    ):
         return
 
-    if not update.message or not update.message.photo:
+    if (
+        not update.message
+        or not update.message.photo
+    ):
         return
 
-    caption = update.message.caption or ""
+    caption = (
+        update.message.caption
+        or ""
+    )
 
     if "|" not in caption:
 
         await update.message.reply_text(
+
             "❌ Caption format ভুল।\n\n"
+
             "Example:\n"
             "06:00 PM|শুভ সন্ধ্যা 🌙"
+
         )
 
         return
 
-    time_part, post_caption = caption.split("|", 1)
+    time_part, post_caption = caption.split(
+        "|",
+        1
+    )
 
     post_caption = post_caption.strip()
 
@@ -521,42 +738,39 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
 
-        post_time = normalize_time(time_part)
+        post_time = normalize_time(
+            time_part
+        )
 
     except ValueError:
 
         await update.message.reply_text(
+
             "❌ Time ভুল।\n\n"
+
             "Example:\n"
             "06:00 AM|সুপ্রভাত 🌞\n"
             "06:00 PM|শুভ সন্ধ্যা 🌙"
+
         )
 
         return
 
-    photo_id = update.message.photo[-1].file_id
+    photo_id = (
+        update.message
+        .photo[-1]
+        .file_id
+    )
 
-    conn = db_connect()
-    cur = conn.cursor()
+    post_id = create_post(
 
-    cur.execute("""
-        INSERT INTO posts (
-            post_time,
-            photo_id,
-            caption,
-            enabled
-        )
-        VALUES (?, ?, ?, 1)
-    """, (
         post_time,
+
         photo_id,
+
         post_caption
-    ))
 
-    post_id = cur.lastrowid
-
-    conn.commit()
-    conn.close()
+    )
 
     schedule_post(
         context.application,
@@ -565,10 +779,13 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
+
         f"✅ Photo post saved!\n\n"
+
         f"🆔 ID: {post_id}\n"
         f"⏰ Time: {display_time(post_time)}\n"
-        f"📅 প্রতিদিন এই সময়ে পোস্ট হবে।"
+        f"📅 প্রতিদিন এই সময়ে পোস্ট হবে।\n"
+        f"🔥 Firebase-এ save হয়েছে।"
     )
 
 
@@ -576,25 +793,20 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # LIST
 # =========================================================
 
-async def list_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def list_posts(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    if not await is_admin(update, context):
+    if not await is_admin(
+        update,
+        context
+    ):
         return
 
-    conn = db_connect()
-    cur = conn.cursor()
+    posts = get_all_posts()
 
-    cur.execute("""
-        SELECT id, post_time, photo_id, caption, enabled
-        FROM posts
-        ORDER BY post_time
-    """)
-
-    rows = cur.fetchall()
-
-    conn.close()
-
-    if not rows:
+    if not posts:
 
         await update.message.reply_text(
             "📭 কোনো post save করা নেই।"
@@ -602,19 +814,60 @@ async def list_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    lines = ["📋 Saved Posts:\n"]
+    posts.sort(
+        key=lambda x: x.get(
+            "post_time",
+            "99:99"
+        )
+    )
 
-    for post_id, post_time, photo_id, caption, enabled in rows:
+    lines = [
+        "📋 Saved Posts:\n"
+    ]
 
-        status = "ON" if enabled else "OFF"
-        post_type = "📷 Photo" if photo_id else "📝 Text"
+    for post in posts:
+
+        post_id = post["id"]
+
+        post_time = post.get(
+            "post_time",
+            "00:00"
+        )
+
+        photo_id = post.get(
+            "photo_id"
+        )
+
+        caption = post.get(
+            "caption",
+            ""
+        )
+
+        enabled = post.get(
+            "enabled",
+            True
+        )
+
+        status = (
+            "ON"
+            if enabled
+            else "OFF"
+        )
+
+        post_type = (
+            "📷 Photo"
+            if photo_id
+            else "📝 Text"
+        )
 
         lines.append(
+
             f"🆔 {post_id}\n"
             f"⏰ {display_time(post_time)}\n"
             f"{post_type}\n"
             f"🔘 {status}\n"
             f"📄 {caption[:80]}\n"
+
         )
 
     await update.message.reply_text(
@@ -626,80 +879,93 @@ async def list_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # DELETE
 # =========================================================
 
-async def delete_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def delete_post(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    if not await is_admin(update, context):
+    if not await is_admin(
+        update,
+        context
+    ):
         return
 
     if not context.args:
 
         await update.message.reply_text(
-            "Example: /delete 3"
+            "Example: /delete POST_ID"
         )
 
         return
 
-    try:
-        post_id = int(context.args[0])
-
-    except ValueError:
-
-        await update.message.reply_text(
-            "❌ ID অবশ্যই সংখ্যা হতে হবে।"
-        )
-
-        return
+    post_id = context.args[0]
 
     job_name = f"post_{post_id}"
 
-    for job in context.application.job_queue.get_jobs_by_name(job_name):
+    for job in (
+        context.application
+        .job_queue
+        .get_jobs_by_name(job_name)
+    ):
+
         job.schedule_removal()
 
-    conn = db_connect()
-    cur = conn.cursor()
-
-    cur.execute(
-        "DELETE FROM posts WHERE id = ?",
-        (post_id,)
+    doc_ref = (
+        db.collection(POSTS_COLLECTION)
+        .document(str(post_id))
     )
 
-    deleted = cur.rowcount
+    doc = doc_ref.get()
 
-    conn.commit()
-    conn.close()
-
-    if deleted:
-
-        await update.message.reply_text(
-            f"✅ Post {post_id} deleted."
-        )
-
-    else:
+    if not doc.exists:
 
         await update.message.reply_text(
             "❌ এই ID পাওয়া যায়নি।"
         )
+
+        return
+
+    doc_ref.delete()
+
+    await update.message.reply_text(
+
+        f"✅ Post {post_id} deleted."
+
+    )
 
 
 # =========================================================
 # CLEAR
 # =========================================================
 
-async def clear_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def clear_posts(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    if not await is_admin(update, context):
+    if not await is_admin(
+        update,
+        context
+    ):
         return
 
-    for job in context.application.job_queue.jobs():
+    for job in (
+        context.application
+        .job_queue
+        .jobs()
+    ):
+
         job.schedule_removal()
 
-    conn = db_connect()
-    cur = conn.cursor()
+    posts = get_all_posts()
 
-    cur.execute("DELETE FROM posts")
+    for post in posts:
 
-    conn.commit()
-    conn.close()
+        db.collection(
+            POSTS_COLLECTION
+        ).document(
+            str(post["id"])
+        ).delete()
 
     await update.message.reply_text(
         "🗑️ সব scheduled post delete করা হয়েছে।"
@@ -710,36 +976,37 @@ async def clear_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ON
 # =========================================================
 
-async def on_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_posts(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    if not await is_admin(update, context):
+    if not await is_admin(
+        update,
+        context
+    ):
         return
 
-    conn = db_connect()
-    cur = conn.cursor()
+    posts = get_all_posts()
 
-    cur.execute(
-        "UPDATE posts SET enabled = 1"
-    )
+    for post in posts:
 
-    conn.commit()
-
-    cur.execute("""
-        SELECT id, post_time
-        FROM posts
-        WHERE enabled = 1
-    """)
-
-    rows = cur.fetchall()
-
-    conn.close()
-
-    for post_id, post_time in rows:
+        db.collection(
+            POSTS_COLLECTION
+        ).document(
+            str(post["id"])
+        ).update({
+            "enabled": True
+        })
 
         schedule_post(
+
             context.application,
-            post_id,
-            post_time
+
+            post["id"],
+
+            post["post_time"]
+
         )
 
     await update.message.reply_text(
@@ -751,23 +1018,36 @@ async def on_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # OFF
 # =========================================================
 
-async def off_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def off_posts(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    if not await is_admin(update, context):
+    if not await is_admin(
+        update,
+        context
+    ):
         return
 
-    for job in context.application.job_queue.jobs():
+    for job in (
+        context.application
+        .job_queue
+        .jobs()
+    ):
+
         job.schedule_removal()
 
-    conn = db_connect()
-    cur = conn.cursor()
+    posts = get_all_posts()
 
-    cur.execute(
-        "UPDATE posts SET enabled = 0"
-    )
+    for post in posts:
 
-    conn.commit()
-    conn.close()
+        db.collection(
+            POSTS_COLLECTION
+        ).document(
+            str(post["id"])
+        ).update({
+            "enabled": False
+        })
 
     await update.message.reply_text(
         "⛔ সব automatic post OFF করা হয়েছে।"
@@ -778,16 +1058,25 @@ async def off_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # TEST
 # =========================================================
 
-async def test_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def test_post(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    if not await is_admin(update, context):
+    if not await is_admin(
+        update,
+        context
+    ):
         return
 
     try:
 
         await context.bot.send_message(
+
             chat_id=TARGET_CHAT,
+
             text="✅ Auto Post Bot Test Message"
+
         )
 
         await update.message.reply_text(
@@ -797,7 +1086,9 @@ async def test_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
 
         await update.message.reply_text(
+
             f"❌ Test failed:\n{e}"
+
         )
 
 
@@ -805,28 +1096,34 @@ async def test_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # STATUS
 # =========================================================
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def status(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    if not await is_admin(update, context):
+    if not await is_admin(
+        update,
+        context
+    ):
         return
 
-    conn = db_connect()
-    cur = conn.cursor()
+    posts = get_all_posts()
 
-    cur.execute(
-        "SELECT COUNT(*) FROM posts WHERE enabled = 1"
+    active = sum(
+        1
+        for post in posts
+        if post.get("enabled", True)
     )
 
-    count = cur.fetchone()[0]
-
-    conn.close()
-
     await update.message.reply_text(
+
         f"🤖 Bot: ONLINE\n"
         f"🌏 Timezone: Bangladesh (Asia/Dhaka)\n"
         f"🎯 Target: {TARGET_CHAT}\n"
-        f"📅 Active posts: {count}\n"
+        f"📅 Active posts: {active}\n"
+        f"🔥 Database: Firebase Firestore\n"
         f"⏰ Time format: 12-hour AM/PM"
+
     )
 
 
@@ -836,8 +1133,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
 
-    init_db()
-
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -846,42 +1141,69 @@ def main():
 
     # Commands
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     application.add_handler(
-        CommandHandler("help", help_command)
+        CommandHandler(
+            "help",
+            help_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("list", list_posts)
+        CommandHandler(
+            "list",
+            list_posts
+        )
     )
 
     application.add_handler(
-        CommandHandler("delete", delete_post)
+        CommandHandler(
+            "delete",
+            delete_post
+        )
     )
 
     application.add_handler(
-        CommandHandler("clear", clear_posts)
+        CommandHandler(
+            "clear",
+            clear_posts
+        )
     )
 
     application.add_handler(
-        CommandHandler("on", on_posts)
+        CommandHandler(
+            "on",
+            on_posts
+        )
     )
 
     application.add_handler(
-        CommandHandler("off", off_posts)
+        CommandHandler(
+            "off",
+            off_posts
+        )
     )
 
     application.add_handler(
-        CommandHandler("test", test_post)
+        CommandHandler(
+            "test",
+            test_post
+        )
     )
 
     application.add_handler(
-        CommandHandler("status", status)
+        CommandHandler(
+            "status",
+            status
+        )
     )
 
-    # Photo messages
+    # Photo
     application.add_handler(
         MessageHandler(
             filters.PHOTO,
@@ -889,23 +1211,46 @@ def main():
         )
     )
 
-    # Text messages
+    # Text
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT
+            & ~filters.COMMAND,
             text_message
         )
     )
 
-    # Load saved schedules
+    # Load Firebase schedules
     schedule_all(application)
 
-    print("===================================")
-    print("🤖 Auto Post Bot Started")
-    print("🌏 Timezone: Asia/Dhaka")
-    print("🎯 Target:", TARGET_CHAT)
-    print("⏰ Time format: 12-hour AM/PM")
-    print("===================================")
+    print(
+        "==================================="
+    )
+
+    print(
+        "🤖 Auto Post Bot Started"
+    )
+
+    print(
+        "🔥 Firebase Firestore"
+    )
+
+    print(
+        "🌏 Timezone: Asia/Dhaka"
+    )
+
+    print(
+        "🎯 Target:",
+        TARGET_CHAT
+    )
+
+    print(
+        "⏰ Time format: 12-hour AM/PM"
+    )
+
+    print(
+        "==================================="
+    )
 
     application.run_polling(
         drop_pending_updates=True
