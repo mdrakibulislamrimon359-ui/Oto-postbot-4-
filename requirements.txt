@@ -1,2 +1,2 @@
 python-telegram-bot[job-queue]
-APScheduler>=3.10.4,<4
+firebase-admin
