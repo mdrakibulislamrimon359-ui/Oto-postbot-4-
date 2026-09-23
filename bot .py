@@ -129,6 +129,56 @@ def load_autopost_data():
 
 AUTOPOST_DATA = load_autopost_data()
 
+
+def normalize_autopost_ids(save=True):
+    """Make visible Auto Post IDs exactly 1..N, with no duplicates."""
+    posts = AUTOPOST_DATA.get("posts", []) or []
+
+    if not posts:
+        changed = AUTOPOST_DATA.get("next_id") != 1
+        AUTOPOST_DATA["posts"] = []
+        AUTOPOST_DATA["next_id"] = 1
+        if changed and save:
+            save_autopost_data()
+        return
+
+    # Preserve existing order first; this is important when old data contains
+    # duplicate/missing IDs. Then assign one unique visible ID to every post.
+    ordered = list(posts)
+    changed = False
+
+    for new_id, post in enumerate(ordered, start=1):
+        try:
+            old_id = int(post.get("id", 0))
+        except Exception:
+            old_id = 0
+        if old_id != new_id:
+            post["id"] = new_id
+            changed = True
+
+    if AUTOPOST_DATA.get("posts") != ordered:
+        AUTOPOST_DATA["posts"] = ordered
+        changed = True
+    else:
+        AUTOPOST_DATA["posts"] = ordered
+
+    expected_next = len(ordered) + 1
+    try:
+        current_next = int(AUTOPOST_DATA.get("next_id", 1))
+    except Exception:
+        current_next = 1
+
+    if current_next != expected_next:
+        AUTOPOST_DATA["next_id"] = expected_next
+        changed = True
+
+    if changed and save:
+        save_autopost_data()
+
+
+# Repair old IDs immediately after loading.
+normalize_autopost_ids(save=False)
+
 def save_autopost_data():
     data = {
         "posts": AUTOPOST_DATA.get("posts", []),
@@ -149,6 +199,9 @@ def save_autopost_data():
             FIRESTORE_DB.collection(FIREBASE_COLLECTION).document(FIREBASE_DOCUMENT).set(data)
         except Exception as e:
             logger.error("Could not save Firebase autopost data: %s", e, exc_info=True)
+
+# Persist any repaired legacy IDs (for example 8, 9 -> 1, 2).
+normalize_autopost_ids(save=True)
 
 def is_admin(update: Update) -> bool:
     user = update.effective_user
@@ -187,9 +240,17 @@ def target_chat_id():
         return TARGET_CHAT_ID
 
 def add_autopost(time_hhmm, post_type, text="", photo_file_id=None):
-    post_id = int(AUTOPOST_DATA.get("next_id", 1))
-    AUTOPOST_DATA["next_id"] = post_id + 1
-    AUTOPOST_DATA.setdefault("posts", []).append({
+    """Add one post with a unique continuous visible ID (1, 2, 3...)."""
+    # IMPORTANT: normalize first, then re-read the CURRENT list.
+    # normalize_autopost_ids() can replace AUTOPOST_DATA["posts"], so a
+    # previously captured local list can become stale and cause ID 2 to repeat.
+    normalize_autopost_ids(save=False)
+    posts = AUTOPOST_DATA.setdefault("posts", [])
+
+    # The visible IDs are already normalized, so the next ID is always N+1.
+    post_id = len(posts) + 1
+
+    posts.append({
         "id": post_id,
         "time": time_hhmm,
         "type": post_type,
@@ -197,35 +258,151 @@ def add_autopost(time_hhmm, post_type, text="", photo_file_id=None):
         "photo_file_id": photo_file_id,
         "last_sent": ""
     })
+
+    AUTOPOST_DATA["posts"] = posts
+    AUTOPOST_DATA["next_id"] = len(posts) + 1
     save_autopost_data()
     return post_id
 
+
 def delete_autopost(post_id):
-    posts = AUTOPOST_DATA.get("posts", [])
-    before = len(posts)
-    AUTOPOST_DATA["posts"] = [p for p in posts if int(p.get("id", -1)) != post_id]
-    if len(AUTOPOST_DATA["posts"]) == before:
+    """Delete one post and immediately renumber remaining posts 1..N."""
+    normalize_autopost_ids(save=False)
+    posts = AUTOPOST_DATA.get("posts", []) or []
+
+    try:
+        target_id = int(post_id)
+    except (TypeError, ValueError):
         return False
+
+    remaining = []
+    deleted = False
+    for post in posts:
+        try:
+            current_id = int(post.get("id", -1))
+        except (TypeError, ValueError):
+            current_id = -1
+
+        if current_id == target_id:
+            deleted = True
+            continue
+        remaining.append(post)
+
+    if not deleted:
+        return False
+
+    # After deletion, IDs must always be 1, 2, 3... with no gaps.
+    for new_id, post in enumerate(remaining, start=1):
+        post["id"] = new_id
+
+    AUTOPOST_DATA["posts"] = remaining
+    AUTOPOST_DATA["next_id"] = len(remaining) + 1
     save_autopost_data()
     return True
 
-def format_autopost_list():
-    posts = AUTOPOST_DATA.get("posts", [])
+
+def find_autopost(post_id):
+    for post in AUTOPOST_DATA.get("posts", []):
+        try:
+            if int(post.get("id", -1)) == int(post_id):
+                return post
+        except Exception:
+            continue
+    return None
+
+
+def split_long_text(text, limit=3900):
+    """Telegram message limit-এর জন্য বড় list কয়েকটি message-এ ভাগ করে।"""
+    text = text or ""
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < 500:
+            cut = limit
+        chunks.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    if text:
+        chunks.append(text)
+    return chunks or [""]
+
+
+def autopost_detail_text(post):
+    pid = post.get("id")
+    ptype = "📷 Photo Post" if post.get("type") == "photo" else "📝 Text Post"
+    caption = post.get("text") or "(কোনো caption নেই)"
+    status = "🟢 ON" if AUTOPOST_DATA.get("enabled", True) else "🔴 OFF"
+    return (
+        "📋 Saved Auto Post\n\n"
+        f"🆔 ID: {pid}\n"
+        f"⏰ Time: {display_time(post.get('time', ''))}\n"
+        f"📌 Type: {ptype}\n"
+        f"⚙️ Auto Post: {status}\n\n"
+        "📝 Caption:\n"
+        f"{caption}"
+    )
+
+
+def autopost_detail_keyboard(post_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Edit", callback_data=f"autopost_edit:{post_id}"),
+            InlineKeyboardButton("🗑️ Delete", callback_data=f"autopost_delete:{post_id}"),
+        ],
+        [InlineKeyboardButton("🔄 Refresh", callback_data=f"autopost_refresh:{post_id}")],
+    ])
+
+
+def format_autopost_list(post_id=None):
+    """Return the saved Auto Post list/detail with continuous unique IDs."""
+    normalize_autopost_ids(save=True)
+
+    posts = sorted(
+        AUTOPOST_DATA.get("posts", []),
+        key=lambda x: int(x.get("id", 0)),
+    )
     status = "ON 🟢" if AUTOPOST_DATA.get("enabled", True) else "OFF 🔴"
+
+    if post_id is not None:
+        post = find_autopost(post_id)
+        if not post:
+            return f"❌ ID {post_id} পাওয়া যায়নি।"
+        return autopost_detail_text(post)
+
     if not posts:
-        return f"📋 Auto Post List\n\nStatus: {status}\n\nকোনো scheduled post নেই।"
-    lines = [f"📋 Auto Post List", f"Status: {status}", ""]
-    for post in sorted(posts, key=lambda x: x.get("time", "")):
-        pid = post.get("id")
-        ptype = "📷 Photo" if post.get("type") == "photo" else "📝 Text"
-        preview = (post.get("text") or "").replace("\n", " ").strip()
-        if len(preview) > 55:
-            preview = preview[:55] + "..."
-        lines.append(
-            f"🆔 {pid} | ⏰ {display_time(post.get('time', ''))} | {ptype}"
-            + (f" | {preview}" if preview else "")
+        return (
+            "📋 ALL SAVED AUTO POSTS\n\n"
+            f"⚙️ Status: {status}\n"
+            "📦 Total: 0\n\n"
+            "কোনো saved post/caption নেই।"
         )
+
+    lines = [
+        "📋 ALL SAVED AUTO POSTS",
+        f"⚙️ Status: {status}",
+        f"📦 Total: {len(posts)}",
+        "",
+        "👇 ID অনুযায়ী সব saved post/caption:",
+    ]
+
+    for post in posts:
+        pid = int(post.get("id", 0))
+        ptype = "📷 Photo" if post.get("type") == "photo" else "📝 Text"
+        caption = (post.get("text") or "(কোনো caption নেই)").strip()
+        lines.extend([
+            "",
+            f"🆔 ID {pid}",
+            f"⏰ {display_time(post.get('time', ''))}",
+            f"📌 {ptype}",
+            f"📝 {caption}",
+        ])
+
+    lines.extend([
+        "",
+        "👆 নির্দিষ্ট পোস্ট খুলতে /list ID লিখুন।",
+        "🗑️ Delete করলে পরের সব ID স্বয়ংক্রিয়ভাবে 1,2,3... হবে।",
+    ])
     return "\n".join(lines)
+
 
 async def auto_post_worker(application: Application):
     logger = logging.getLogger(__name__)
@@ -734,50 +911,160 @@ async def _admin_only(update: Update) -> bool:
         await update.message.reply_text("⛔ এই command শুধু Admin ব্যবহার করতে পারবে।")
     return False
 
-async def autopost_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _admin_only(update): return
-    if update.message: await update.message.reply_text(format_autopost_list())
 
 async def autopost_delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _admin_only(update): return
+    if not await _admin_only(update):
+        return
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text("ব্যবহার: /delete ID")
         return
-    pid=int(context.args[0])
+    pid = int(context.args[0])
     if delete_autopost(pid):
         await update.message.reply_text(f"✅ Auto Post ID {pid} delete হয়েছে।")
     else:
         await update.message.reply_text(f"❌ ID {pid} পাওয়া যায়নি।")
 
+
 async def autopost_clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _admin_only(update): return
-    AUTOPOST_DATA["posts"]=[]
+    if not await _admin_only(update):
+        return
+    AUTOPOST_DATA["posts"] = []
+    AUTOPOST_DATA["next_id"] = 1
     save_autopost_data()
     await update.message.reply_text("🗑️ সব Auto Post delete হয়েছে।")
 
+
 async def autopost_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _admin_only(update): return
-    AUTOPOST_DATA["enabled"]=True
+    if not await _admin_only(update):
+        return
+    AUTOPOST_DATA["enabled"] = True
     save_autopost_data()
     await update.message.reply_text("✅ Auto Post ON 🟢")
 
+
 async def autopost_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _admin_only(update): return
-    AUTOPOST_DATA["enabled"]=False
+    if not await _admin_only(update):
+        return
+    AUTOPOST_DATA["enabled"] = False
     save_autopost_data()
     await update.message.reply_text("⛔ Auto Post OFF 🔴")
 
+
 async def autopost_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _admin_only(update): return
-    chat_id=target_chat_id()
+    if not await _admin_only(update):
+        return
+    chat_id = target_chat_id()
     if not chat_id:
         await update.message.reply_text("❌ TARGET_CHAT_ID সেট করা নেই।")
         return
     try:
-        await context.bot.send_message(chat_id=chat_id, text="🧪 RJ Team Auto Post Test সফল হয়েছে।")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🧪 RJ Team Auto Post Test সফল হয়েছে।",
+        )
         await update.message.reply_text("✅ Group-এ test post পাঠানো হয়েছে।")
     except Exception as e:
         await update.message.reply_text(f"❌ Test failed: {e}")
+
+
+
+async def autopost_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _admin_only(update):
+        return
+
+    normalize_autopost_ids(save=True)
+
+    post_id = None
+    if context.args and context.args[0].isdigit():
+        post_id = int(context.args[0])
+
+    if post_id is not None:
+        post = find_autopost(post_id)
+        if not post:
+            await update.message.reply_text(
+                f"❌ ID {post_id} পাওয়া যায়নি।\nবর্তমান ID গুলো /list দিয়ে দেখুন।"
+            )
+            return
+
+        if post.get("type") == "photo" and post.get("photo_file_id"):
+            try:
+                await update.message.reply_photo(
+                    photo=post["photo_file_id"],
+                    caption=(post.get("text") or "(ক্যাপশন নেই)")[:1024],
+                    reply_markup=autopost_detail_keyboard(post_id),
+                )
+                return
+            except Exception as e:
+                logger.error("Could not display saved photo ID %s: %s", post_id, e, exc_info=True)
+
+        await update.message.reply_text(
+            autopost_detail_text(post),
+            reply_markup=autopost_detail_keyboard(post_id),
+            disable_web_page_preview=True,
+        )
+        return
+
+    normalize_autopost_ids(save=True)
+    posts = list(AUTOPOST_DATA.get("posts", []) or [])
+    if not posts:
+        await update.message.reply_text("📋 ALL SAVED AUTO POSTS\n\n📦 Total: 0")
+        return
+
+    status = "ON 🟢" if AUTOPOST_DATA.get("enabled", True) else "OFF 🔴"
+    header = (
+        "📋 ALL SAVED AUTO POSTS\n\n"
+        f"⚙️ Status: {status}\n"
+        f"📦 Total: {len(posts)}\n\n"
+        "👇 সব saved post/caption:"
+    )
+
+    # Send the complete captions in chunks so Telegram's 4096-character
+    # message limit cannot hide later saved captions.
+    chunks = [header]
+    current = header
+
+    for post in posts:
+        pid = int(post.get("id", 0))
+        ptype = "📷 Photo" if post.get("type") == "photo" else "📝 Text"
+        caption = (post.get("text") or "(ক্যাপশন নেই)").strip()
+        entry = f"\n\n🆔 LIST {pid}\n{ptype}\n📝 {caption}"
+
+        if len(current) + len(entry) > 3800:
+            chunks.append(current)
+            current = f"📋 CONTINUED — SAVED POSTS\n{entry.lstrip()}"
+        else:
+            current += entry
+
+    if current:
+        chunks.append(current)
+
+    # The ID buttons stay in a compact grid, so every saved item is touchable.
+    keyboard = []
+    row = []
+    for post in posts:
+        pid = int(post.get("id", 0))
+        row.append(
+            InlineKeyboardButton(
+                f"🆔 LIST {pid}",
+                callback_data=f"autopost_open:{pid}",
+            )
+        )
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([
+        InlineKeyboardButton("🔄 Refresh List", callback_data="autopost_list")
+    ])
+
+    for i, chunk in enumerate(chunks):
+        await update.message.reply_text(
+            chunk,
+            reply_markup=InlineKeyboardMarkup(keyboard) if i == len(chunks) - 1 else None,
+            disable_web_page_preview=True,
+        )
+
 
 async def autopost_command(
     update: Update,
@@ -818,7 +1105,66 @@ async def autopost_command(
         return
 
     if action == "list":
-        await update.message.reply_text(format_autopost_list())
+        normalize_autopost_ids(save=True)
+        posts = list(AUTOPOST_DATA.get("posts", []) or [])
+        if not posts:
+            await update.message.reply_text("📋 ALL SAVED AUTO POSTS\n\n📦 Total: 0")
+            return
+
+        status = "ON 🟢" if AUTOPOST_DATA.get("enabled", True) else "OFF 🔴"
+        lines = [
+            "📋 ALL SAVED AUTO POSTS",
+            "",
+            f"⚙️ Status: {status}",
+            f"📦 Total: {len(posts)}",
+            "",
+        ]
+        keyboard = []
+        row = []
+
+        for post in posts:
+            pid = int(post.get("id", 0))
+            ptype = "📷 Photo" if post.get("type") == "photo" else "📝 Text"
+            caption = (post.get("text") or "(ক্যাপশন নেই)").strip()
+            lines.append(f"🆔 LIST {pid}\n{ptype}\n📝 {caption}")
+
+            row.append(
+                InlineKeyboardButton(
+                    f"🆔 LIST {pid}",
+                    callback_data=f"autopost_open:{pid}",
+                )
+            )
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+
+        if row:
+            keyboard.append(row)
+        keyboard.append([
+            InlineKeyboardButton("🔄 Refresh List", callback_data="autopost_list")
+        ])
+
+        # Split if needed to respect Telegram's text limit.
+        full = "\n\n".join(lines)
+        if len(full) <= 3800:
+            await update.message.reply_text(
+                full,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                disable_web_page_preview=True,
+            )
+        else:
+            current = "📋 ALL SAVED AUTO POSTS\n\n"
+            for line in lines[4:]:
+                block = line + "\n\n"
+                if len(current) + len(block) > 3800:
+                    await update.message.reply_text(current, disable_web_page_preview=True)
+                    current = "📋 CONTINUED — SAVED POSTS\n\n"
+                current += block
+            await update.message.reply_text(
+                current,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                disable_web_page_preview=True,
+            )
         return
 
     if action == "delete":
@@ -1094,6 +1440,257 @@ async def translate_command(
 
 
 # =========================================================
+# AUTO POST EDIT / DELETE BUTTONS
+# =========================================================
+
+async def autopost_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    if context.user_data.pop("autopost_edit_id", None) is not None:
+        await update.message.reply_text("❌ Edit বাতিল করা হয়েছে।")
+    else:
+        await update.message.reply_text("ℹ️ কোনো Auto Post edit mode চালু নেই।")
+
+
+async def autopost_edit_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Edit mode-এ থাকা admin-এর নতুন time|caption নেয়।"""
+    if not update.message or not update.message.text:
+        return False
+    if not is_admin(update):
+        return False
+
+    post_id = context.user_data.get("autopost_edit_id")
+    if post_id is None:
+        return False
+
+    raw = update.message.text.strip()
+    if raw.lower() == "/cancel":
+        context.user_data.pop("autopost_edit_id", None)
+        await update.message.reply_text("❌ Edit বাতিল করা হয়েছে।")
+        return True
+
+    if "|" not in raw:
+        await update.message.reply_text(
+            "❌ Format ভুল।\n\n"
+            "এভাবে দিন:\n"
+            "10:30 PM|নতুন caption\n\n"
+            "অথবা:\n"
+            "22:30|নতুন caption\n\n"
+            "বাতিল করতে /cancel লিখুন।"
+        )
+        return True
+
+    time_text, caption = raw.split("|", 1)
+    hhmm = parse_ampm_time(time_text.strip())
+    caption = caption.strip()
+
+    if not hhmm:
+        await update.message.reply_text(
+            "❌ সময় ঠিক নয়। উদাহরণ: 10:30 PM|নতুন caption"
+        )
+        return True
+
+    if not caption:
+        await update.message.reply_text("❌ Caption খালি রাখা যাবে না।")
+        return True
+
+    post = find_autopost(post_id)
+    if not post:
+        context.user_data.pop("autopost_edit_id", None)
+        await update.message.reply_text(f"❌ ID {post_id} পাওয়া যায়নি।")
+        return True
+
+    post["time"] = hhmm
+    post["text"] = caption
+    # সময়/caption বদলানোর পর আজকের পুরনো send-state reset করা হবে,
+    # যাতে নতুন schedule-টি আবার কাজ করতে পারে।
+    post["last_sent"] = ""
+    save_autopost_data()
+    context.user_data.pop("autopost_edit_id", None)
+
+    await update.message.reply_text(
+        f"✅ ID {post_id} update হয়েছে।\n\n"
+        f"⏰ Time: {display_time(hhmm)}\n"
+        f"📝 Caption:\n{caption}",
+        reply_markup=autopost_detail_keyboard(post_id),
+        disable_web_page_preview=True,
+    )
+    return True
+
+
+async def autopost_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    if not is_admin(update):
+        await query.answer("⛔ শুধু Admin ব্যবহার করতে পারবে।", show_alert=True)
+        return
+
+    if query.data == "autopost_list":
+        normalize_autopost_ids(save=True)
+        posts = sorted(
+            AUTOPOST_DATA.get("posts", []),
+            key=lambda x: int(x.get("id", 0)),
+        )
+
+        if not posts:
+            await query.edit_message_text(format_autopost_list())
+            return
+
+        keyboard = []
+        row = []
+        for saved_post in posts:
+            pid = int(saved_post.get("id", 0))
+            row.append(
+                InlineKeyboardButton(
+                    f"🆔 ID {pid}",
+                    callback_data=f"autopost_open:{pid}",
+                )
+            )
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+
+        if row:
+            keyboard.append(row)
+
+        keyboard.append([
+            InlineKeyboardButton(
+                "🔄 Refresh List",
+                callback_data="autopost_list",
+            )
+        ])
+
+        status = "ON 🟢" if AUTOPOST_DATA.get("enabled", True) else "OFF 🔴"
+        await query.edit_message_text(
+            f"📋 ALL SAVED AUTO POSTS\n\n"
+            f"⚙️ Status: {status}\n"
+            f"📦 Total: {len(posts)}\n\n"
+            "👇 যে ID দেখতে চান সেটিতে Touch করুন:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if (query.data or "").startswith("autopost_open:"):
+        try:
+            post_id = int(query.data.split(":", 1)[1])
+        except Exception:
+            await query.answer("❌ Invalid ID", show_alert=True)
+            return
+
+        normalize_autopost_ids(save=True)
+        post = find_autopost(post_id)
+        if not post:
+            await query.answer("❌ এই ID আর নেই।", show_alert=True)
+            await query.edit_message_text(format_autopost_list(), reply_markup=None)
+            return
+
+        await query.answer(f"ID {post_id}")
+        if post.get("type") == "photo" and post.get("photo_file_id"):
+            try:
+                await query.message.reply_photo(
+                    photo=post["photo_file_id"],
+                    caption=(post.get("text") or "(ক্যাপশন নেই)")[:1024],
+                    reply_markup=autopost_detail_keyboard(post_id),
+                )
+                return
+            except Exception as e:
+                logger.error("Could not display saved photo ID %s: %s", post_id, e, exc_info=True)
+
+        await query.edit_message_text(
+            autopost_detail_text(post),
+            reply_markup=autopost_detail_keyboard(post_id),
+            disable_web_page_preview=True,
+        )
+        return
+
+    data = query.data or ""
+    try:
+        action, raw_id = data.split(":", 1)
+        post_id = int(raw_id)
+    except Exception:
+        await query.answer("❌ Invalid request", show_alert=True)
+        return
+
+    post = find_autopost(post_id)
+
+    if action == "autopost_refresh":
+        await query.answer("🔄 Refresh")
+        if not post:
+            await query.edit_message_text(f"❌ ID {post_id} পাওয়া যায়নি।")
+            return
+        await query.edit_message_text(
+            autopost_detail_text(post),
+            reply_markup=autopost_detail_keyboard(post_id),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if action == "autopost_edit":
+        await query.answer("✏️ Edit mode")
+        if not post:
+            await query.edit_message_text(f"❌ ID {post_id} পাওয়া যায়নি।")
+            return
+
+        context.user_data["autopost_edit_id"] = post_id
+        await query.message.reply_text(
+            f"✏️ ID {post_id} Edit Mode\n\n"
+            f"বর্তমান সময়: {display_time(post.get('time', ''))}\n"
+            f"বর্তমান caption:\n{post.get('text') or '(খালি)'}\n\n"
+            "নতুন format লিখুন:\n"
+            "10:30 PM|নতুন caption\n\n"
+            "অথবা:\n"
+            "22:30|নতুন caption\n\n"
+            "❌ Cancel করতে /cancel লিখুন।"
+        )
+        return
+
+    if action == "autopost_delete":
+        await query.answer("🗑️ Delete")
+        if not post:
+            await query.edit_message_text(f"❌ ID {post_id} পাওয়া যায়নি।")
+            return
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Yes, Delete", callback_data=f"autopost_delete_yes:{post_id}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"autopost_delete_no:{post_id}"),
+            ]
+        ])
+        await query.edit_message_text(
+            f"⚠️ ID {post_id} কি সত্যিই delete করবেন?\n\n"
+            f"⏰ {display_time(post.get('time', ''))}\n"
+            f"📝 {post.get('text') or '(কোনো caption নেই)'}",
+            reply_markup=keyboard,
+        )
+        return
+
+    if action == "autopost_delete_yes":
+        if delete_autopost(post_id):
+            await query.answer("✅ Deleted")
+            await query.edit_message_text(f"🗑️ ID {post_id} সফলভাবে delete হয়েছে।")
+        else:
+            await query.answer("ID পাওয়া যায়নি", show_alert=True)
+            await query.edit_message_text(f"❌ ID {post_id} পাওয়া যায়নি।")
+        return
+
+    if action == "autopost_delete_no":
+        await query.answer("❌ Cancelled")
+        post = find_autopost(post_id)
+        if post:
+            await query.edit_message_text(
+                autopost_detail_text(post),
+                reply_markup=autopost_detail_keyboard(post_id),
+                disable_web_page_preview=True,
+            )
+        else:
+            await query.edit_message_text(f"❌ ID {post_id} পাওয়া যায়নি।")
+        return
+
+
+# =========================================================
 # BUTTON HANDLER
 # =========================================================
 
@@ -1174,6 +1771,12 @@ async def handle_message(
 
     if not text:
         return
+
+    # Admin Auto Post edit mode আগে handle হবে; AI-তে যাবে না।
+    if context.user_data.get("autopost_edit_id") is not None:
+        handled = await autopost_edit_message(update, context)
+        if handled:
+            return
 
     try:
 
@@ -1349,10 +1952,18 @@ def main():
     application.add_handler(CommandHandler("on", autopost_on_command))
     application.add_handler(CommandHandler("off", autopost_off_command))
     application.add_handler(CommandHandler("test", autopost_test_command))
+    application.add_handler(CommandHandler("cancel", autopost_cancel_command))
 
     # =====================================================
     # BUTTONS
     # =====================================================
+
+    application.add_handler(
+        CallbackQueryHandler(
+            autopost_callback_handler,
+            pattern=r"^(autopost_list|autopost_open:\d+|autopost_(edit|delete|refresh|delete_yes|delete_no):\d+)$",
+        )
+    )
 
     application.add_handler(
         CallbackQueryHandler(
