@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "RJteam1").strip().lstrip("@")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
-TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "").strip()
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "").strip()  # legacy single-group support
 AUTOPOST_FILE = os.getenv("AUTOPOST_FILE", "autoposts.json")
 BD_TZ = ZoneInfo("Asia/Dhaka")
 
@@ -94,7 +94,7 @@ FIRESTORE_DB = init_firebase()
 # =========================================================
 
 def _local_load_autopost_data():
-    default = {"posts": [], "next_id": 1, "enabled": AUTOPOST_ENABLED}
+    default = {"posts": [], "next_id": 1, "enabled": AUTOPOST_ENABLED, "groups": []}
     try:
         if not os.path.exists(AUTOPOST_FILE):
             return default
@@ -103,6 +103,7 @@ def _local_load_autopost_data():
         data.setdefault("posts", [])
         data.setdefault("next_id", 1)
         data.setdefault("enabled", AUTOPOST_ENABLED)
+        data.setdefault("groups", [])
         return data
     except Exception as e:
         logger.error("Could not load local autopost data: %s", e)
@@ -119,6 +120,7 @@ def load_autopost_data():
             data.setdefault("posts", [])
             data.setdefault("next_id", 1)
             data.setdefault("enabled", AUTOPOST_ENABLED)
+            data.setdefault("groups", [])
             return data
         # First run: migrate any existing local data into Firebase.
         FIRESTORE_DB.collection(FIREBASE_COLLECTION).document(FIREBASE_DOCUMENT).set(local_data)
@@ -184,6 +186,7 @@ def save_autopost_data():
         "posts": AUTOPOST_DATA.get("posts", []),
         "next_id": int(AUTOPOST_DATA.get("next_id", 1)),
         "enabled": bool(AUTOPOST_DATA.get("enabled", True)),
+        "groups": AUTOPOST_DATA.get("groups", []) or [],
     }
     # Always keep a local backup too.
     try:
@@ -202,6 +205,8 @@ def save_autopost_data():
 
 # Persist any repaired legacy IDs (for example 8, 9 -> 1, 2).
 normalize_autopost_ids(save=True)
+get_saved_groups()
+save_autopost_data()
 
 def is_admin(update: Update) -> bool:
     user = update.effective_user
@@ -231,6 +236,95 @@ def display_time(hhmm: str) -> str:
     except Exception:
         return hhmm
 
+def get_saved_groups():
+    groups = AUTOPOST_DATA.get("groups", []) or []
+    cleaned = []
+    seen = set()
+    for g in groups:
+        try:
+            chat_id = int(g.get("chat_id"))
+        except Exception:
+            continue
+        if chat_id in seen:
+            continue
+        seen.add(chat_id)
+        cleaned.append({
+            "chat_id": chat_id,
+            "title": (g.get("title") or f"Group {chat_id}").strip(),
+            "username": (g.get("username") or "").strip(),
+            "active": bool(g.get("active", True)),
+        })
+    AUTOPOST_DATA["groups"] = cleaned
+    return cleaned
+
+
+def save_group(chat_id, title="", username=""):
+    try:
+        chat_id = int(chat_id)
+    except Exception:
+        return False
+    groups = get_saved_groups()
+    for g in groups:
+        if int(g["chat_id"]) == chat_id:
+            if title:
+                g["title"] = title
+            if username:
+                g["username"] = username
+            g["active"] = True
+            save_autopost_data()
+            return False
+    groups.append({
+        "chat_id": chat_id,
+        "title": title or f"Group {chat_id}",
+        "username": username or "",
+        "active": True,
+    })
+    AUTOPOST_DATA["groups"] = groups
+    save_autopost_data()
+    return True
+
+
+def delete_group(chat_id):
+    try:
+        target = int(chat_id)
+    except Exception:
+        return False
+    groups = get_saved_groups()
+    remaining = [g for g in groups if int(g["chat_id"]) != target]
+    if len(remaining) == len(groups):
+        return False
+    AUTOPOST_DATA["groups"] = remaining
+    save_autopost_data()
+    return True
+
+
+def active_group_ids():
+    return [int(g["chat_id"]) for g in get_saved_groups() if g.get("active", True)]
+
+
+def group_list_text():
+    groups = get_saved_groups()
+    if not groups:
+        return "👥 ACTIVE GROUPS\n\n📦 Total: 0\n\nগ্রুপে /addgroup লিখে আগে গ্রুপটি যোগ করুন।"
+    lines = ["👥 ACTIVE GROUPS", "", f"📦 Total: {len([g for g in groups if g.get('active', True)])}", ""]
+    for i, g in enumerate(groups, 1):
+        status = "🟢 Active" if g.get("active", True) else "🔴 Inactive"
+        uname = f"\n🔗 @{g['username']}" if g.get("username") else ""
+        lines.append(f"{i}️⃣ {g.get('title') or 'Unnamed Group'}\n🆔 {g['chat_id']}{uname}\n{status}")
+    return "\n\n".join(lines)
+
+
+def group_id_from_index(index):
+    groups = get_saved_groups()
+    try:
+        i = int(index) - 1
+        if 0 <= i < len(groups):
+            return int(groups[i]["chat_id"])
+    except Exception:
+        pass
+    return None
+
+
 def target_chat_id():
     if not TARGET_CHAT_ID:
         return None
@@ -256,7 +350,8 @@ def add_autopost(time_hhmm, post_type, text="", photo_file_id=None):
         "type": post_type,
         "text": text or "",
         "photo_file_id": photo_file_id,
-        "last_sent": ""
+        "last_sent": "",
+        "last_sent_by_group": {}
     })
 
     AUTOPOST_DATA["posts"] = posts
@@ -406,55 +501,57 @@ def format_autopost_list(post_id=None):
 
 async def auto_post_worker(application: Application):
     logger = logging.getLogger(__name__)
-    logger.info("Automatic group post system started.")
+    logger.info("Automatic multi-group post system started.")
     while True:
         try:
-            if TARGET_CHAT_ID and AUTOPOST_DATA.get("enabled", True):
+            if AUTOPOST_DATA.get("enabled", True):
                 now = datetime.now(BD_TZ)
                 now_hhmm = now.strftime("%H:%M")
                 today_key = now.strftime("%Y-%m-%d")
-
+                groups = active_group_ids()
                 changed = False
+
+                # Legacy TARGET_CHAT_ID is also accepted and added automatically.
+                if not groups and TARGET_CHAT_ID:
+                    legacy = target_chat_id()
+                    if legacy:
+                        save_group(legacy, "Legacy Target Group")
+                        groups = active_group_ids()
+
                 for post in AUTOPOST_DATA.get("posts", []):
                     if post.get("time") != now_hhmm:
                         continue
-                    if post.get("last_sent") == today_key:
-                        continue
+                    sent_map = post.setdefault("last_sent_by_group", {})
 
-                    try:
-                        chat_id = target_chat_id()
-                        if post.get("type") == "photo" and post.get("photo_file_id"):
-                            await application.bot.send_photo(
-                                chat_id=chat_id,
-                                photo=post["photo_file_id"],
-                                caption=post.get("text", "")[:1024] or None,
-                            )
-                        else:
-                            await application.bot.send_message(
-                                chat_id=chat_id,
-                                text=post.get("text", "")[:4096],
-                                disable_web_page_preview=True,
-                            )
-
-                        post["last_sent"] = today_key
-                        changed = True
-                        logger.info(
-                            "Auto post sent | id=%s | time=%s",
-                            post.get("id"), post.get("time")
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "Auto post failed | id=%s | %s",
-                            post.get("id"), e
-                        )
+                    for chat_id in groups:
+                        key = str(chat_id)
+                        if sent_map.get(key) == today_key:
+                            continue
+                        try:
+                            if post.get("type") == "photo" and post.get("photo_file_id"):
+                                await application.bot.send_photo(
+                                    chat_id=chat_id,
+                                    photo=post["photo_file_id"],
+                                    caption=(post.get("text") or "")[:1024] or None,
+                                )
+                            else:
+                                await application.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=(post.get("text") or "")[:4096],
+                                    disable_web_page_preview=True,
+                                )
+                            sent_map[key] = today_key
+                            changed = True
+                            logger.info("Auto post sent | id=%s | group=%s | time=%s", post.get("id"), chat_id, post.get("time"))
+                        except Exception as e:
+                            logger.error("Auto post failed | id=%s | group=%s | %s", post.get("id"), chat_id, e)
 
                 if changed:
                     save_autopost_data()
 
             await asyncio.sleep(20)
-
         except asyncio.CancelledError:
-            logger.info("Automatic group post system stopped.")
+            logger.info("Automatic multi-group post system stopped.")
             raise
         except Exception as e:
             logger.error("Auto post worker error: %s", e, exc_info=True)
@@ -912,6 +1009,45 @@ async def _admin_only(update: Update) -> bool:
     return False
 
 
+async def addgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _admin_only(update):
+        return
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("❌ এই commandটি যে গ্রুপে bot-কে যোগ করেছেন সেই গ্রুপের ভিতর থেকে দিন।")
+        return
+    added = save_group(chat.id, chat.title or "Unnamed Group", getattr(chat, "username", "") or "")
+    await update.message.reply_text(
+        ("✅ Group active list-এ যোগ হয়েছে।" if added else "✅ Group আগে থেকেই active ছিল, তথ্য update হয়েছে.")
+        + f"\n\n👥 {chat.title or 'Unnamed Group'}\n🆔 {chat.id}\n\n" + group_list_text()
+    )
+
+
+async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _admin_only(update):
+        return
+    await update.message.reply_text(group_list_text())
+
+
+async def delgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _admin_only(update):
+        return
+    if not context.args:
+        await update.message.reply_text("ব্যবহার: /delgroup 2\nঅথবা: /delgroup -100123456789")
+        return
+    raw = context.args[0]
+    chat_id = group_id_from_index(raw) if raw.isdigit() and not raw.startswith("-") else None
+    if chat_id is None:
+        try:
+            chat_id = int(raw)
+        except Exception:
+            chat_id = None
+    if chat_id is None or not delete_group(chat_id):
+        await update.message.reply_text("❌ Group পাওয়া যায়নি। /groups দিয়ে তালিকা দেখুন।")
+        return
+    await update.message.reply_text("🗑️ Group active list থেকে delete হয়েছে।\n\n" + group_list_text())
+
+
 async def autopost_delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _admin_only(update):
         return
@@ -953,9 +1089,10 @@ async def autopost_off_command(update: Update, context: ContextTypes.DEFAULT_TYP
 async def autopost_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _admin_only(update):
         return
-    chat_id = target_chat_id()
+    groups = active_group_ids()
+    chat_id = groups[0] if groups else target_chat_id()
     if not chat_id:
-        await update.message.reply_text("❌ TARGET_CHAT_ID সেট করা নেই।")
+        await update.message.reply_text("❌ কোনো active group নেই। গ্রুপের ভিতর /addgroup দিন।")
         return
     try:
         await context.bot.send_message(
@@ -1085,7 +1222,7 @@ async def autopost_command(
             "/autopost off - Auto post বন্ধ\n"
             "/autopost list - সব scheduled post\n"
             "/autopost add 8:30 PM আপনার পোস্ট - Text post যোগ\n"
-            "/autopost addphoto 8:30 PM - Photo post যোগ (photo-তে reply করে)\n"
+            "/autopost addphoto 8:30 PM Caption - Photo + caption post (photo-তে reply করে)\n"
             "/autopost delete 1 - ID দিয়ে delete"
         )
         return
@@ -1944,6 +2081,10 @@ def main():
             autopost_command,
         )
     )
+
+    application.add_handler(CommandHandler("addgroup", addgroup_command))
+    application.add_handler(CommandHandler("groups", groups_command))
+    application.add_handler(CommandHandler("delgroup", delgroup_command))
 
     # Short admin aliases: /list /delete /clear /on /off /test
     application.add_handler(CommandHandler("list", autopost_list_command))
