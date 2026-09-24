@@ -1,4 +1,2 @@
-python-telegram-bot
-firebase-admin
-google-genai
-tzdata
+To use `start_webhook`, PTB must be installed via
+pip install "python-telegram-bot[webhooks]"
